@@ -26,6 +26,59 @@ from pydantic import SecretStr
 SYSTEM_PROMPT = """You are a bioinformatics assistant with access to several databases.
 Always use tools to retrieve real data, never invent accessions or sequences.
 For multi-step questions, chain tools: search -> get entry -> get interactions.
+
+Report every answer as a research paper, using these headings in this order.
+Adapt each section to a database query. Do not pad a section to fill it.
+
+## Abstract
+150-250 words: the problem, the resources and filters used, the key numbers,
+and why the result matters.
+
+## I. Introduction
+**Background.** What the organism, gene, or pathway is, and why the question
+matters.
+**Literature Review.** Only records you actually retrieved, such as linked
+PubMed entries. If you retrieved none, write "No literature was retrieved for
+this query." Never cite a paper you did not fetch with a tool.
+**Knowledge Gap.** What was unresolved before the query.
+**Objective & Hypothesis.** The question restated as an objective, with the
+testable expectation where one applies.
+
+## II. Materials and Methods
+**Study Design.** Which resources you selected and why you routed to them.
+**Materials.** Each database queried, named with the tool that reached it.
+**Procedures.** Every tool call in order with its exact arguments and filters,
+in enough detail that a reader could re-run the analysis.
+**Statistical Analysis.** How each number was derived: deduplication, the
+denominator behind any percentage, and the field the count came from.
+
+## III. Results
+**Data Presentation.** A markdown table whenever there is more than one number
+to compare. Label it (Table 1, Table 2).
+**Findings.** The counts and proportions, stated plainly. No adjectives, no
+emphasis, no emotional modifiers.
+
+## IV. Discussion
+**Interpretation.** What the numbers mean and whether they meet the objective.
+**Context.** How they relate to the records you retrieved.
+**Limitations.** The caveats the tools reported in their provenance, plus what
+these data cannot establish.
+**Conclusion & Future Directions.** The takeaway and the next query worth running.
+
+## References
+Number every source [1], [2], ... Give the database name and the exact
+provenance URL from the tool result. Copy each URL verbatim: never shorten,
+reconstruct, or guess one.
+
+## Acknowledgments
+Name the data providers whose records you used.
+
+These rules override the format:
+- Never invent a number, accession, citation, or URL. Every figure must trace to
+  a tool result in this conversation.
+- If a section has no basis in retrieved data, write one line saying so. An
+  empty section is correct; an invented one is not.
+- Report, do not persuade.
 """
 
 # ---------------------------------------------------------------------------
@@ -201,9 +254,10 @@ MCP_SERVERS = {
 
 # Overridable from .env so nobody has to commit a model switch. The default is
 # unchanged; the commented lines below are the other providers that are wired.
-# LLM_MODEL = os.environ.get("LLM_MODEL", "openrouter/google/gemma-4-26b-a4b-it")
+LLM_MODEL = os.environ.get("LLM_MODEL", "openrouter/google/gemma-4-26b-a4b-it")
 # LLM_MODEL="openrouter/mistralai/mistral-small-2603"
 # LLM_MODEL="cesnet/qwen3-coder"
+# LLM_MODEL="ollama/qwen3.5:9b"
 # LLM_MODEL="ollama/gemma4"
 # LLM_MODEL="mistralai/mistral-small-latest"
 # LLM_MODEL="anthropic/claude-opus-5"
@@ -245,7 +299,18 @@ def load_chat_model(model: str) -> BaseChatModel:
             model=model_name,
             base_url=ARGO_BASE_URL,
             api_key=SecretStr(os.environ["ARGO_USER"]),
-            max_completion_tokens=2048,
+            # The Argo shim ignores max_completion_tokens -- which is what LangChain
+            # renames max_tokens to -- and honours max_tokens only. Without it the
+            # model runs to its maximum output length, and on the Claude models a
+            # non-streaming call then trips the upstream ten-minute guard with
+            # HTTP 500 "Streaming is required". extra_body bypasses the rename.
+            # Measured by laptop_system_improvement, 17 Sep 2026. 4096 rather than
+            # 2048 because the reasoning tiers spend part of the cap on reasoning
+            # tokens and return empty at 2048.
+            extra_body={"max_tokens": 4096},
+            # Ask for usage on the final streamed chunk, so token counts are
+            # recorded even on the streaming path chatbot.py and the evals use.
+            stream_usage=True,
         )
     if provider == "ollama":
         from langchain_ollama import ChatOllama
@@ -261,19 +326,55 @@ def load_chat_model(model: str) -> BaseChatModel:
     raise ValueError(f"Unknown provider: {provider}")
 
 
-async def init_agent():
-    # Connect to each MCP server individually so that one failure (e.g. a 401
-    # from an OAuth-protected server) doesn't take down all the others.
-    all_tools = []
-    for name in MCP_SERVERS:
+def _root_cause(exc: BaseException) -> str:
+    """The innermost real error.
+
+    A failed MCP connection surfaces as an ExceptionGroup wrapping a TaskGroup,
+    whose str() is "unhandled errors in a TaskGroup" and says nothing about what
+    went wrong. Unwrap it so the startup line names the actual cause.
+    """
+    seen = 0
+    while seen < 10:
+        inner = getattr(exc, "exceptions", None)
+        if not inner:
+            break
+        exc = inner[0]
+        seen += 1
+    return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+
+
+async def load_tools(servers: dict) -> tuple[list, dict]:
+    """Collect tools from every server, skipping the ones that are down.
+
+    MultiServerMCPClient.get_tools() fans out across all servers and raises if
+    any one of them is unreachable, which took the whole chat down at startup
+    whenever a single local server was not running. Asking each server
+    separately costs a missing one its tools and nothing else.
+    """
+    tools: list = []
+    report: dict = {}
+    for name, config in servers.items():
         try:
-            client = MultiServerMCPClient({name: MCP_SERVERS[name]})
-            tools = await client.get_tools()
-            all_tools.extend(tools)
-        except Exception as exc:
-            print(f"[warn] MCP server '{name}' unavailable, skipping: {exc}")
+            server_tools = await MultiServerMCPClient({name: config}).get_tools()
+        except Exception as exc:  # unreachable, refused, timed out, bad protocol
+            report[name] = f"unavailable: {_root_cause(exc)}"
+            continue
+        tools.extend(server_tools)
+        report[name] = f"{len(server_tools)} tools"
+    return tools, report
+
+
+async def init_agent():
+    tools, report = await load_tools(MCP_SERVERS)
+    for name, status in report.items():
+        print(f"  {name:22s} {status}")
+    if not tools:
+        raise RuntimeError(
+            "No MCP server answered. Start them with run_mcp_servers.py, or trim "
+            "MCP_SERVERS to the ones you are running."
+        )
     llm = load_chat_model(LLM_MODEL)
-    return create_agent(model=llm, tools=all_tools, system_prompt=SYSTEM_PROMPT)
+    return create_agent(model=llm, tools=tools, system_prompt=SYSTEM_PROMPT)
 
 
 @cl.on_chat_start
@@ -343,5 +444,27 @@ async def set_starters(user: cl.User | None = None, language: str | None = None)
         cl.Starter(
             label="STRING interactions TP53",
             message="What are the interaction partners of TP53 with high confidence?",
+        ),
+        cl.Starter(
+            label="GEO expression under ciprofloxacin",
+            message=(
+                "Which E. coli gene expression studies involve ciprofloxacin, and "
+                "where are the actual expression values for the top one?"
+            ),
+        ),
+        cl.Starter(
+            label="BRC what can I run on E. coli",
+            message=(
+                "Which genome assemblies does BRC Analytics hold for Escherichia "
+                "coli, and which analysis workflows can I run on them?"
+            ),
+        ),
+        cl.Starter(
+            label="Expression study to runnable workflow",
+            message=(
+                "Find an E. coli antibiotic resistance expression study in GEO, "
+                "then tell me whether AMR Gene Detection can run on the E. coli "
+                "reference genome."
+            ),
         ),
     ]

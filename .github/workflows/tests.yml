@@ -1,0 +1,40 @@
+name: tests
+
+# Offline only. The suite must never depend on NCBI, ENA, UniProt or BRC being
+# up, and must never spend the shared per-IP rate budget from CI. Tests marked
+# `live` are deselected by pyproject's addopts and stay that way here.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # pyproject pins requires-python to ==3.13.*, so let uv resolve it rather
+      # than pinning a version here that can drift out of agreement with it.
+      - name: Sync dependencies
+        run: uv sync
+
+      - name: Compile every server
+        # Catches a syntax error in a server that no test imports, which is the
+        # easy way for a broken file to reach main.
+        run: uv run python -m compileall -q mcp_servers chatbot.py run_mcp_servers.py
+
+      - name: Run the offline suite
+        run: uv run pytest -q
+
+      - name: Confirm the live tests really were skipped
+        # A suite that silently started hitting NCBI from CI would look like a
+        # pass while burning a shared budget. Assert the deselection held.
+        run: |
+          uv run pytest --collect-only -q 2>&1 | tail -3
+          uv run pytest --collect-only -q -m live 2>&1 | tail -3

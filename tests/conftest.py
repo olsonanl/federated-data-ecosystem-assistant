@@ -240,8 +240,15 @@ def mv_schema(myvariant):
 
 
 @pytest.fixture(autouse=True)
-def block_network(mygene, myvariant, pubmed, monkeypatch):
-    """Fail any request a test did not arrange, so the suite stays offline."""
+def block_network(mygene, myvariant, pubmed, geo, brc, monkeypatch, request):
+    """Fail any request a test did not arrange, so the suite stays offline.
+
+    Tests marked `live` are exempt: they exist precisely to reach the real
+    services, and are deselected by default (pyproject's addopts) so a plain
+    `pytest` still never touches the network.
+    """
+    if request.node.get_closest_marker("live"):
+        return
 
     def refuse(method: str, url: str, **kwargs: Any):
         raise AssertionError(
@@ -257,6 +264,11 @@ def block_network(mygene, myvariant, pubmed, monkeypatch):
     monkeypatch.setattr(myvariant.requests, "request", refuse)
     # pubmed.py calls requests.get directly rather than requests.request.
     monkeypatch.setattr(pubmed.requests, "get", refuse_get)
+    # geo.py holds one module-level Session and calls .get on it, so the refusal
+    # goes on the session rather than on the requests module.
+    monkeypatch.setattr(geo._session, "get", refuse_get)
+    # brc_analytics.py calls requests.get at module level.
+    monkeypatch.setattr(brc.requests, "get", refuse_get)
 
 
 @pytest.fixture
@@ -390,3 +402,193 @@ def pm_record(pubmed, block_network, monkeypatch) -> Callable[..., PMRecorder]:
         return recorder
 
     return install
+
+
+# ---------------------------------------------------------------------------
+# geo.py keeps one module-level requests.Session and a module-level pacer, and
+# reads both resp.json() and resp.text (the FTP listings are HTML). The mock
+# below matches that shape, and resets the pacer so the suite does not sleep.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class GeoCall:
+    url: str
+    params: dict
+
+
+class GeoFakeResponse:
+    def __init__(self, body: Any, status: int = 200, headers: dict | None = None):
+        self._body = body
+        self.status_code = status
+        self.headers = headers or {}
+
+    @property
+    def text(self) -> str:
+        if isinstance(self._body, str):
+            return self._body
+        return json.dumps(self._body)
+
+    def json(self) -> Any:
+        if isinstance(self._body, str):
+            return json.loads(self._body)
+        return self._body
+
+
+class GeoRecorder:
+    """Stands in for geo._session.get.
+
+    `responses` is a single body, or a list replayed in order, or a callable
+    taking (url, params). A body may be a (body, status) or
+    (body, status, headers) tuple to drive the retry paths.
+    """
+
+    def __init__(self, responses: Any = None):
+        self.calls: list[GeoCall] = []
+        self._responses = responses
+        self._index = 0
+
+    def __call__(self, url: str, params: dict | None = None, timeout: int = 60, **kw: Any):
+        self.calls.append(GeoCall(url, dict(params or {})))
+        body = self._responses
+        if callable(body):
+            body = body(url, params)
+        elif isinstance(body, list):
+            body = body[min(self._index, len(body) - 1)]
+            self._index += 1
+        status, headers = 200, {}
+        if isinstance(body, tuple):
+            if len(body) == 3:
+                body, status, headers = body
+            else:
+                body, status = body
+        return GeoFakeResponse(body, status, headers)
+
+    @property
+    def last(self) -> GeoCall:
+        return self.calls[-1]
+
+
+@pytest.fixture
+def geo(request):
+    """The GEO server module.
+
+    Offline tests get the pacer reset so the suite does not sleep. Live tests
+    must NOT get that: resetting it between tests lets the first call of each
+    test fire immediately after the last call of the previous one, which defeats
+    the server's own rate limiter and earns an HTTP 429 from NCBI. Measured --
+    that is exactly how the first live run failed.
+    """
+    import geo as module
+
+    live = request.node.get_closest_marker("live") is not None
+    if not live:
+        module._last_request_at = 0.0
+    yield module
+    if not live:
+        module._last_request_at = 0.0
+
+
+@pytest.fixture
+def geo_record(geo, block_network, monkeypatch) -> Callable[..., GeoRecorder]:
+    """Install a GeoRecorder in place of geo._session.get."""
+
+    def install(responses: Any = None) -> GeoRecorder:
+        recorder = GeoRecorder(responses)
+        monkeypatch.setattr(geo._session, "get", recorder)
+        return recorder
+
+    return install
+
+
+def geo_esummary(uid: str, **fields: Any) -> dict:
+    """An esummary db=gds envelope around one record."""
+    record = {"uid": uid, "accession": "", "entrytype": "", "title": "", **fields}
+    return {"result": {"uids": [uid], uid: record}}
+
+
+def geo_esearch(count: int, ids: list[str], translation: str = "") -> dict:
+    return {"esearchresult": {"count": str(count), "idlist": ids,
+                              "querytranslation": translation}}
+
+
+# ---------------------------------------------------------------------------
+# brc_analytics.py calls requests.get(url, params=..., headers=..., timeout=...)
+# and reads resp.json() and resp.text. It reuses GeoFakeResponse, whose shape
+# matches, but installs on the requests module rather than on a Session.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def brc():
+    """The BRC Analytics complement server module."""
+    import brc_analytics as module
+
+    return module
+
+
+@pytest.fixture
+def brc_record(brc, block_network, monkeypatch) -> Callable[..., GeoRecorder]:
+    """Install a recorder in place of brc_analytics.requests.get."""
+
+    def install(responses: Any = None) -> GeoRecorder:
+        recorder = GeoRecorder(responses)
+        monkeypatch.setattr(brc.requests, "get", recorder)
+        return recorder
+
+    return install
+
+
+def ena_row(run: str = "ERR1", **fields: Any) -> dict:
+    """One ENA read_run row, in the shape the portal API returns."""
+    row = {
+        "run_accession": run,
+        "study_accession": "PRJEB8667",
+        "sample_accession": "SAMEA1",
+        "scientific_name": "Escherichia coli",
+        "library_strategy": "WGS",
+        "read_count": "1000",
+        # ENA returns these with no scheme at all, which no client can follow.
+        "fastq_ftp": f"ftp.sra.ebi.ac.uk/vol1/fastq/{run}/{run}_1.fastq.gz;"
+                     f"ftp.sra.ebi.ac.uk/vol1/fastq/{run}/{run}_2.fastq.gz",
+    }
+    row.update(fields)
+    return row
+
+
+# ---------------------------------------------------------------------------
+# A neighbour spending the shared NCBI budget is not a test failure.
+# ---------------------------------------------------------------------------
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item):
+    """For `live` tests only, turn an NCBI 429 into a skip.
+
+    NCBI meters 3 requests/second PER IP across all of its hosts, so on a shared
+    network that budget goes to whoever asks first. Measured at the venue:
+    {"count": "4", "limit": "3"} while the server was pacing itself at 2/s from
+    this process alone.
+
+    A red suite that means "someone else was busy" gets ignored within a day,
+    and then it is not a suite. Setting NCBI_API_KEY meters per key instead of
+    per IP and these stop firing.
+
+    A fixture cannot do this: pytest does not raise the test body's exception at
+    the fixture's yield, so the exception has to be caught around the call hook.
+    """
+    outcome = yield
+    if item.get_closest_marker("live") is None:
+        return
+    excinfo = outcome.excinfo
+    if excinfo is None:
+        return
+    text = str(excinfo[1])
+    if "429" in text or "rate limit" in text.lower():
+        outcome.force_exception(
+            pytest.skip.Exception(
+                "NCBI returned 429. The 3/sec ceiling is per IP and is shared on "
+                "this network, so this says a neighbour spent the budget, not "
+                "that the code is wrong. Set NCBI_API_KEY to meter per key."
+            )
+        )

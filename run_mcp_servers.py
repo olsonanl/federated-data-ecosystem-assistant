@@ -6,7 +6,16 @@ Usage:
 
 import subprocess
 
-SERVERS = ["pdn.py", "mygene.py", "uniprot.py", "myvariant.py", "ncbi.py", "pubmed.py"]
+SERVERS = [
+    "pdn.py",            # 8001
+    "mygene.py",         # 8002
+    "uniprot.py",        # 8003
+    "myvariant.py",      # 8004
+    "ncbi.py",           # 8005
+    "pubmed.py",         # 8006
+    "geo.py",            # 8009
+    "brc_analytics.py",  # 8008
+]
 
 procs = [subprocess.Popen(["uv", "run", f"mcp_servers/{name}"]) for name in SERVERS]
 
