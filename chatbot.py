@@ -1,6 +1,13 @@
 """Chatbot with an agentic tool-call loop over MCP servers tools."""
 
+import asyncio
+import json
 import os
+import threading
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import chainlit as cl
 from langchain.agents import create_agent
@@ -8,12 +15,115 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
+from mcp.client.auth.oauth2 import (
+    OAuthClientInformationFull,
+    OAuthClientMetadata,
+    OAuthClientProvider,
+    OAuthToken,
+)
 from pydantic import SecretStr
 
 SYSTEM_PROMPT = """You are a bioinformatics assistant with access to several databases.
 Always use tools to retrieve real data, never invent accessions or sequences.
 For multi-step questions, chain tools: search -> get entry -> get interactions.
 """
+
+# ---------------------------------------------------------------------------
+# OAuth helpers for BV-BRC
+# ---------------------------------------------------------------------------
+
+OAUTH_CALLBACK_PORT = 8910
+OAUTH_TOKEN_FILE = Path(".bvbrc_oauth_tokens.json")
+
+
+class _FileTokenStorage:
+    """Persist OAuth tokens and client info to a local JSON file."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    def _read(self) -> dict:
+        if self._path.exists():
+            return json.loads(self._path.read_text())
+        return {}
+
+    def _write(self, data: dict) -> None:
+        self._path.write_text(json.dumps(data, indent=2))
+
+    async def get_tokens(self) -> OAuthToken | None:
+        raw = self._read().get("tokens")
+        return OAuthToken.model_validate(raw) if raw else None
+
+    async def set_tokens(self, tokens: OAuthToken) -> None:
+        data = self._read()
+        data["tokens"] = tokens.model_dump(mode="json")
+        self._write(data)
+
+    async def get_client_info(self) -> OAuthClientInformationFull | None:
+        raw = self._read().get("client_info")
+        return OAuthClientInformationFull.model_validate(raw) if raw else None
+
+    async def set_client_info(self, client_info: OAuthClientInformationFull) -> None:
+        data = self._read()
+        data["client_info"] = client_info.model_dump(mode="json")
+        self._write(data)
+
+
+async def _oauth_redirect_handler(url: str) -> None:
+    """Open the OAuth authorization URL in the user's default browser."""
+    print(f"[oauth] Opening browser for BV-BRC login...")
+    webbrowser.open(url)
+
+
+async def _oauth_callback_handler() -> tuple[str, str | None]:
+    """Start a one-shot HTTP server, wait for the OAuth callback, return (code, state)."""
+    result: dict[str, str | None] = {}
+    ready = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            qs = parse_qs(urlparse(self.path).query)
+            result["code"] = qs.get("code", [None])[0]
+            result["state"] = qs.get("state", [None])[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                b"<html><body><h2>Authentication complete.</h2>"
+                b"<p>You can close this tab and return to the chatbot.</p>"
+                b"</body></html>"
+            )
+            loop.call_soon_threadsafe(ready.set)
+
+        def log_message(self, format, *args):  # noqa: A002
+            pass  # suppress request logs
+
+    server = HTTPServer(("127.0.0.1", OAUTH_CALLBACK_PORT), _Handler)
+
+    def _serve():
+        server.handle_request()  # serve exactly one request
+        server.server_close()
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+    await ready.wait()
+    return result.get("code", ""), result.get("state")
+
+
+def _bvbrc_auth() -> OAuthClientProvider:
+    """Build an OAuthClientProvider for the BV-BRC MCP server."""
+    return OAuthClientProvider(
+        server_url="https://dev-9.bv-brc.org",
+        client_metadata=OAuthClientMetadata(
+            redirect_uris=[f"http://localhost:{OAUTH_CALLBACK_PORT}/callback"],
+            client_name="BV-BRC Chatbot",
+        ),
+        storage=_FileTokenStorage(OAUTH_TOKEN_FILE),
+        redirect_handler=_oauth_redirect_handler,
+        callback_handler=_oauth_callback_handler,
+    )
+
 
 # Existing MCP servers or local ones running on localhost. The local servers are started by the `mcp_servers` scripts.
 MCP_SERVERS = {
@@ -52,6 +162,11 @@ MCP_SERVERS = {
         "pubmed": {
             "url": "http://127.0.0.1:8006/mcp-pubmed",
             "transport": "streamable_http",
+        },
+        "bv-brc": {
+            "url": "https://dev-9.bv-brc.org",
+            "transport": "streamable_http",
+            "auth": _bvbrc_auth(),
         },
     }
 
@@ -116,10 +231,18 @@ def load_chat_model(model: str) -> BaseChatModel:
 
 
 async def init_agent():
-    mcp_client = MultiServerMCPClient(MCP_SERVERS)
-    tools = await mcp_client.get_tools()
+    # Connect to each MCP server individually so that one failure (e.g. a 401
+    # from an OAuth-protected server) doesn't take down all the others.
+    all_tools = []
+    for name in MCP_SERVERS:
+        try:
+            client = MultiServerMCPClient({name: MCP_SERVERS[name]})
+            tools = await client.get_tools()
+            all_tools.extend(tools)
+        except Exception as exc:
+            print(f"[warn] MCP server '{name}' unavailable, skipping: {exc}")
     llm = load_chat_model(LLM_MODEL)
-    return create_agent(model=llm, tools=tools, system_prompt=SYSTEM_PROMPT)
+    return create_agent(model=llm, tools=all_tools, system_prompt=SYSTEM_PROMPT)
 
 
 @cl.on_chat_start

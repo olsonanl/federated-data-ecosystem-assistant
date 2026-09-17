@@ -12,3 +12,4 @@ chainlit.md
 docs/
 CLAUDE.md
 scratch/
+.bvbrc_oauth_tokens.json
